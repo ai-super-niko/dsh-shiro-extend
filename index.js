@@ -55,6 +55,29 @@ const LOG_MAX_BYTES = 256 * 1024
 const PENDING_DELETE_DIR = join("plugins", PACKAGE_NAME, "pending-session-deletions")
 const PENDING_DELETE_RETRY_MS = 30000
 
+/**
+ * Provider retries this plugin adds when a server-sent-event frame is not JSON.
+ *
+ * The pi-ai adapter classifies such a failure as `PI_AI_ERROR`, a code that the
+ * default retry policy does not cover and that is not offered as a retry
+ * choice, so one transiently corrupted frame — a gateway emitting
+ * `data: : keep-alive` instead of a `: keep-alive` comment — ends the turn. The
+ * budget is per step and independent of the provider policy, so it can never
+ * be compounded into an unbounded retry loop.
+ */
+const MALFORMED_SSE_RETRY_LIMIT = 2
+
+/**
+ * Failure text that means an SSE `data:` payload was not JSON.
+ *
+ * Matches the OpenAI SDK reader (`Error reading response: malformed
+ * server-sent event JSON.`) and pi-ai's Codex reader (`Invalid Codex SSE
+ * JSON`). Text matching is forced on us: pi-ai flattens the original error to
+ * its message before DSH classifies it, so no structured cause reaches a
+ * plugin, and `classifyPiAiError` has no branch for this wording.
+ */
+const MALFORMED_SSE_MESSAGE = /malformed server-sent event JSON|invalid codex SSE JSON/i
+
 /** Paths already reported, so a 30-second poll does not become one line per tick. */
 const reportedPaths = new Set()
 
@@ -139,6 +162,21 @@ function classifySessionDeleteError(error) {
 /** Extract a diagnostic string without exposing an arbitrary thrown value. */
 function errorMessage(error) {
   return error instanceof Error ? error.message : String(error)
+}
+
+/**
+ * Whether a failed request is the unparseable SSE frame the retry budget covers.
+ *
+ * Exported for the tests: the decision has to stay independent of the Cordis
+ * context to be worth asserting on.
+ *
+ * @param {{ code?: string, message?: string } | undefined} failure - the normalized request failure.
+ * @returns {boolean} true when the stream frame itself could not be parsed.
+ */
+export function isMalformedSseFailure(failure) {
+  if (failure === undefined || failure === null) return false
+  if (failure.code !== "PI_AI_ERROR") return false
+  return MALFORMED_SSE_MESSAGE.test(String(failure.message ?? ""))
 }
 
 /** Resolve the session directory and prove it remains below the persistence root. */
@@ -855,6 +893,43 @@ export function apply(ctx) {
       service.disposePendingDeleteWorker()
     }
   }, "shiro-extend: pending session deletions")
+
+  // Work around an upstream classification gap: an SSE frame that is not JSON
+  // fails the attempt as `PI_AI_ERROR`, which no retry policy covers, so a
+  // transiently corrupting gateway ends the turn with "运行失败". Retry inside
+  // the still-open step instead — the failed attempt committed no assistant
+  // message, so a retry cannot duplicate output.
+  ctx.effect(() => {
+    /** Per-agent, per-step retry budgets; the agent key is weak so disposal frees it. */
+    const budgets = new WeakMap()
+    const stopError = ctx.on("agent/request-error", async ({ agent, turn, step, provider, failure, retryPolicy, signal }, next) => {
+      if (agent === undefined || !isMalformedSseFailure(failure) || signal?.aborted === true) return next()
+      // An explicit `maxRetries: 0` is the user asking for no retries at all.
+      if (retryPolicy?.mode === "normal" && retryPolicy.maxRetries === 0) return next()
+      const attemptKey = `${String(turn)}:${String(step)}`
+      const attemptsByStep = budgets.get(agent) ?? new Map()
+      budgets.set(agent, attemptsByStep)
+      const attempts = attemptsByStep.get(attemptKey) ?? 0
+      if (attempts >= MALFORMED_SSE_RETRY_LIMIT) {
+        // Keep the exhausted counter for the rest of the step: resetting it here
+        // would let another recovery listener's retry replenish this budget and
+        // turn a hard cap into a loop. `agent/status` (idle) clears it instead.
+        void note(`sse-retry-exhausted provider=${provider} turn=${String(turn)} step=${String(step)} attempts=${String(attempts)}`)
+        return next()
+      }
+      attemptsByStep.set(attemptKey, attempts + 1)
+      void note(`sse-retry provider=${provider} turn=${String(turn)} step=${String(step)} attempt=${String(attempts + 1)}`)
+      return { kind: "retry" }
+    })
+    // A new turn starts from idle; drop budgets so a later turn retries afresh.
+    const stopIdle = ctx.on("agent/status", ({ agent, status }) => {
+      if (status === "idle") budgets.delete(agent)
+    })
+    return () => {
+      stopError()
+      stopIdle()
+    }
+  }, "shiro-extend: malformed SSE retry")
 
   // Activation marker: seeing this line after a restart proves the Host half
   // loaded and published its endpoints. A following `status ...` line proves
