@@ -2,8 +2,10 @@
  * dsh-shiro-extend — host half.
  *
  * Shiro's personal DSH extensions. This half owns the git operations used by
- * the session status row and blank-session (Hero) composer, plus the guarded
- * persistence operation used to permanently delete eligible sessions.
+ * the session status row and blank-session (Hero) composer, the guarded
+ * persistence operation used to permanently delete eligible sessions, and the
+ * SSE stream repair in `lib/sse-guard.js` that keeps a gateway's malformed
+ * heartbeat frames from ending a turn.
  *
  * Bridge design. A Client slot can only reach Host code through a Remote
  * namespace. The generated `./typert` artifact path is unavailable to a
@@ -31,6 +33,8 @@ import { createHash, randomUUID } from "node:crypto"
 import { appendFile, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path"
+
+import { installSseGuard } from "./lib/sse-guard.js"
 
 /** The Cordis service key and the wire namespace both use this name. */
 const SERVICE_KEY = "shiroGit"
@@ -893,6 +897,15 @@ export function apply(ctx) {
       service.disposePendingDeleteWorker()
     }
   }, "shiro-extend: pending session deletions")
+
+  // Repair the gateway's malformed heartbeat frames where the stream is read.
+  // This runs before the retry guard below, and it is what actually fixes the
+  // failure: a gateway that emits `data: : keep-alive` every idle interval
+  // reproduces the same invalid frame on every retry.
+  ctx.effect(() => {
+    const restore = installSseGuard((line) => void note(`sse-guard ${line}`))
+    return restore
+  }, "shiro-extend: SSE stream repair")
 
   // Work around an upstream classification gap: an SSE frame that is not JSON
   // fails the attempt as `PI_AI_ERROR`, which no retry policy covers, so a

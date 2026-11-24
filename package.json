@@ -1,15 +1,16 @@
 {
   "name": "dsh-shiro-extend",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "private": true,
-  "description": "Shiro's personal DSH extensions: git branch controls, workspace view toggle, permanent session deletion, and a retry guard for corrupted server-sent-event frames.",
+  "description": "Shiro's personal DSH extensions: git branch controls, workspace view toggle, permanent session deletion, an SSE stream repair for malformed gateway heartbeats, and a retry guard for corrupted server-sent-event frames.",
   "type": "module",
   "main": "./index.js",
   "exports": {
     ".": "./index.js",
     "./client": "./lib/client.js",
     "./cordis.patch.yml": "./cordis.patch.yml",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./lib/sse-guard.js": "./lib/sse-guard.js"
   },
   "dsh": {
     "bundle": {
